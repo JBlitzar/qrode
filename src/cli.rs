@@ -162,7 +162,10 @@ fn derived_target_out_path(out_png: &PathBuf) -> PathBuf {
 pub fn run(args: CliArgs) -> Result<()> {
 	let ecc = match args.ecc.as_str() {
 		"H" | "h" => EccLevel::H,
-		_ => return Err(QrodeError::Internal("only ECC H is supported".into())),
+        "L" | "l" => EccLevel::L,
+        "M" | "m" => EccLevel::M,
+        "Q" | "q" => EccLevel::Q,
+		_ => return Err(QrodeError::Internal("invalid ECC level. Expected H, L, M, or Q".into())),
 	};
 
 	let spec = QrSpec {

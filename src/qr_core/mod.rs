@@ -1,9 +1,13 @@
 use qrcodegen::{Mask, QrCode, QrCodeEcc, QrSegment, Version};
+use rand::{Rng, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 pub type Module = bool;
 pub type Matrix = Vec<Vec<Module>>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum EccLevel {
 	L,
 	M,
@@ -11,12 +15,12 @@ pub enum EccLevel {
 	H,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum DataMode {
 	Byte,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MaskPattern {
 	M0,
 	M1,
@@ -28,7 +32,7 @@ pub enum MaskPattern {
 	M7,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct QrSpec {
 	pub version: u8,
 	pub ecc: EccLevel,
@@ -59,6 +63,17 @@ pub enum QrodeError {
 }
 
 pub type Result<T> = std::result::Result<T, QrodeError>;
+
+static CAPACITY_CACHE: OnceLock<Mutex<HashMap<QrSpec, usize>>> = OnceLock::new();
+static IMMUTABLE_MASK_CACHE: OnceLock<Mutex<HashMap<(QrSpec, MaskPattern), Matrix>>> = OnceLock::new();
+
+fn capacity_cache() -> &'static Mutex<HashMap<QrSpec, usize>> {
+	CAPACITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn immutable_cache() -> &'static Mutex<HashMap<(QrSpec, MaskPattern), Matrix>> {
+	IMMUTABLE_MASK_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 impl EccLevel {
 	fn to_qrcodegen(self) -> QrCodeEcc {
@@ -110,6 +125,19 @@ impl MaskPattern {
 			Self::M6 => 6,
 			Self::M7 => 7,
 		})
+	}
+
+	fn to_u8(self) -> u8 {
+		match self {
+			Self::M0 => 0,
+			Self::M1 => 1,
+			Self::M2 => 2,
+			Self::M3 => 3,
+			Self::M4 => 4,
+			Self::M5 => 5,
+			Self::M6 => 6,
+			Self::M7 => 7,
+		}
 	}
 }
 
@@ -176,6 +204,15 @@ pub fn capacity_bytes(spec: QrSpec) -> Result<usize> {
 		return Err(QrodeError::Internal("only byte mode is supported".into()));
 	}
 
+	if let Some(cached) = capacity_cache()
+		.lock()
+		.map_err(|_| QrodeError::Internal("capacity cache lock poisoned".into()))?
+		.get(&spec)
+		.copied()
+	{
+		return Ok(cached);
+	}
+
 	let mut lo = 0usize;
 	let mut hi = 4096usize;
 	while lo < hi {
@@ -197,6 +234,11 @@ pub fn capacity_bytes(spec: QrSpec) -> Result<usize> {
 			hi = mid - 1;
 		}
 	}
+
+	capacity_cache()
+		.lock()
+		.map_err(|_| QrodeError::Internal("capacity cache lock poisoned".into()))?
+		.insert(spec, lo);
 	Ok(lo)
 }
 
@@ -209,14 +251,33 @@ pub fn encode_auto_mask(spec: QrSpec, payload: &[u8]) -> Result<EncodedQr> {
 }
 
 pub fn immutable_mask(spec: QrSpec, mask: MaskPattern) -> Result<Matrix> {
+	if let Some(cached) = immutable_cache()
+		.lock()
+		.map_err(|_| QrodeError::Internal("immutable cache lock poisoned".into()))?
+		.get(&(spec, mask))
+		.cloned()
+	{
+		return Ok(cached);
+	}
+
 	let cap = capacity_bytes(spec)?;
 	let base_payload = vec![0u8; cap];
 	let base = encode_with_mask(spec, &base_payload, mask)?;
 	let size = base.modules.len();
 
 	let mut mutable = vec![vec![false; size]; size];
+	let total_bits = cap * 8;
+	let samples = total_bits.min(512);
+	let mut rng = Xoshiro256PlusPlus::seed_from_u64(
+		(spec.version as u64) << 32 | (mask.to_u8() as u64) << 24 | cap as u64,
+	);
+	for i in 0..samples {
+		let bit_idx = if samples == total_bits {
+			i
+		} else {
+			rng.gen_range(0..total_bits)
+		};
 
-	for bit_idx in 0..(cap * 8) {
 		let mut payload = base_payload.clone();
 		let byte_idx = bit_idx / 8;
 		let bit = (bit_idx % 8) as u8;
@@ -238,6 +299,11 @@ pub fn immutable_mask(spec: QrSpec, mask: MaskPattern) -> Result<Matrix> {
 			immutable[y][x] = !mutable[y][x];
 		}
 	}
+
+	immutable_cache()
+		.lock()
+		.map_err(|_| QrodeError::Internal("immutable cache lock poisoned".into()))?
+		.insert((spec, mask), immutable.clone());
 	Ok(immutable)
 }
 

@@ -1,17 +1,26 @@
 use rand::{Rng, SeedableRng};
+use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
+use rayon::prelude::*;
 use std::time::Instant;
 
 use crate::qr_core::{
 	EncodedQr, MaskPattern, QrSpec, QrodeError, Result, capacity_bytes, encode_with_mask, immutable_mask,
 };
 use crate::scoring::{ScoreBreakdown, ScoreWeights, score_modules};
+use crate::validator::decode_modules_payload;
 
 #[derive(Clone, Debug)]
 pub struct OptimizeConfig {
 	pub spec: QrSpec,
 	pub fixed_mask: Option<MaskPattern>,
 	pub search_masks: bool,
+	pub allowed_mutable_bytes: Option<Vec<u8>>,
+	pub enable_image_space_perturb: bool,
+	pub image_space_perturb_iters: u64,
+	pub bitwise_seed_init: bool,
+	pub coordinate_refine_sweeps: u32,
+	pub max_time_ms: Option<u128>,
 	pub seed: u64,
 	pub max_iters: u64,
 	pub restarts: u32,
@@ -28,11 +37,17 @@ impl Default for OptimizeConfig {
 		Self {
 			spec: QrSpec {
 				version: 5,
-				ecc: crate::qr_core::EccLevel::M,
+				ecc: crate::qr_core::EccLevel::H,
 				mode: crate::qr_core::DataMode::Byte,
 			},
 			fixed_mask: Some(MaskPattern::M0),
 			search_masks: false,
+			allowed_mutable_bytes: None,
+			enable_image_space_perturb: true,
+			image_space_perturb_iters: 2_000,
+			bitwise_seed_init: true,
+			coordinate_refine_sweeps: 3,
+			max_time_ms: None,
 			seed: 1,
 			max_iters: 10_000,
 			restarts: 3,
@@ -68,6 +83,21 @@ struct EvalContext {
 	masks: Vec<(MaskPattern, Vec<Vec<bool>>)>,
 }
 
+fn weighted_index(weights: &[f32], rng: &mut Xoshiro256PlusPlus) -> usize {
+	let total: f32 = weights.iter().copied().sum();
+	if total <= f32::EPSILON {
+		return rng.gen_range(0..weights.len());
+	}
+	let mut r = rng.gen_range(0.0..total);
+	for (i, &w) in weights.iter().enumerate() {
+		r -= w.max(0.0);
+		if r <= 0.0 {
+			return i;
+		}
+	}
+	weights.len() - 1
+}
+
 fn anneal_temp(cfg: &OptimizeConfig, iter: u64) -> f32 {
 	if cfg.max_iters <= 1 {
 		return cfg.final_temp.max(1e-9);
@@ -76,6 +106,14 @@ fn anneal_temp(cfg: &OptimizeConfig, iter: u64) -> f32 {
 	let a = cfg.init_temp.max(1e-9).ln();
 	let b = cfg.final_temp.max(1e-9).ln();
 	((1.0 - t) * a + t * b).exp()
+}
+
+fn random_mutable_byte(cfg: &OptimizeConfig, rng: &mut Xoshiro256PlusPlus) -> u8 {
+	if let Some(allowed) = cfg.allowed_mutable_bytes.as_ref() {
+		allowed[rng.gen_range(0..allowed.len())]
+	} else {
+		rng.r#gen()
+	}
 }
 
 fn build_eval_context(cfg: &OptimizeConfig) -> Result<EvalContext> {
@@ -113,46 +151,88 @@ fn evaluate_payload(
 	best.ok_or_else(|| QrodeError::Internal("no mask candidates available".into()))
 }
 
-fn mutate_payload(candidate: &mut [u8], prefix_len: usize, cfg: &OptimizeConfig, rng: &mut Xoshiro256PlusPlus) {
+fn mutate_payload(
+	candidate: &mut [u8],
+	prefix_len: usize,
+	cfg: &OptimizeConfig,
+	influence: &[f32],
+	rng: &mut Xoshiro256PlusPlus,
+) -> Vec<usize> {
 	if prefix_len >= candidate.len() {
-		return;
+		return Vec::new();
 	}
 	let start = prefix_len;
 	let len = candidate.len() - prefix_len;
+	if len == 0 {
+		return Vec::new();
+	}
+	let mut touched = Vec::with_capacity(8);
 
 	if rng.gen_bool(cfg.block_mutation_prob as f64) {
-		let block_len = rng.gen_range(1..=len.min(8));
+		let block_len = rng.gen_range(2..=len.min(16));
 		let block_start = rng.gen_range(start..=(candidate.len() - block_len));
-		for b in &mut candidate[block_start..block_start + block_len] {
-			*b = rng.r#gen();
+		for (offset, b) in candidate[block_start..block_start + block_len].iter_mut().enumerate() {
+			*b = random_mutable_byte(cfg, rng);
+			touched.push(block_start + offset);
 		}
-		return;
+		return touched;
 	}
 
 	if rng.gen_bool(cfg.byte_mutation_rate as f64) {
 		let idx = rng.gen_range(start..candidate.len());
-		candidate[idx] = rng.r#gen();
+		candidate[idx] = random_mutable_byte(cfg, rng);
+		touched.push(idx);
 	}
 
-	if rng.gen_bool(cfg.bit_mutation_rate as f64) {
-		let idx = rng.gen_range(start..candidate.len());
-		let bit = rng.gen_range(0..8);
-		candidate[idx] ^= 1u8 << bit;
+	if cfg.allowed_mutable_bytes.is_none() {
+		if rng.gen_bool(cfg.bit_mutation_rate as f64) {
+			let idx = rng.gen_range(start..candidate.len());
+			let bit = rng.gen_range(0..8);
+			candidate[idx] ^= 1u8 << bit;
+			touched.push(idx);
+		}
+
+		if rng.gen_bool(cfg.guided_mutation_prob as f64) {
+			let idx = start + weighted_index(influence, rng);
+			let bit = rng.gen_range(0..8);
+			candidate[idx] ^= 1u8 << bit;
+			touched.push(idx);
+		}
+	} else if rng.gen_bool(cfg.guided_mutation_prob as f64) {
+		let idx = start + weighted_index(influence, rng);
+		candidate[idx] = random_mutable_byte(cfg, rng);
+		touched.push(idx);
 	}
 
-	if rng.gen_bool(cfg.guided_mutation_prob as f64) {
+	if touched.is_empty() {
 		let idx = rng.gen_range(start..candidate.len());
-		let tweak = if rng.gen_bool(0.5) { 0x0f } else { 0xf0 };
-		candidate[idx] ^= tweak;
+		if cfg.allowed_mutable_bytes.is_none() {
+			let bit = rng.gen_range(0..8);
+			candidate[idx] ^= 1u8 << bit;
+		} else {
+			candidate[idx] = random_mutable_byte(cfg, rng);
+		}
+		touched.push(idx);
 	}
+
+	touched.sort_unstable();
+	touched.dedup();
+	touched
 }
 
 fn run_single_restart(
 	input: &OptimizeInput,
 	cfg: &OptimizeConfig,
 	eval_ctx: &EvalContext,
+	seed_payload: Option<&[u8]>,
+	restart_idx: u32,
 	seed: u64,
 ) -> Result<(Vec<u8>, EncodedQr, ScoreBreakdown)> {
+	let restart_started = Instant::now();
+	let stop_at = cfg
+		.max_time_ms
+		.map(|budget| restart_started + std::time::Duration::from_millis(budget as u64));
+
 	let cap = capacity_bytes(cfg.spec)?;
 	if input.prefix.len() > cap {
 		return Err(QrodeError::PrefixTooLong {
@@ -162,20 +242,50 @@ fn run_single_restart(
 	}
 
 	let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-	let mut current = vec![0u8; cap];
+	let mut current = if let Some(seed_payload) = seed_payload {
+		let mut seeded = seed_payload.to_vec();
+		// Diversify restarts by perturbing the deterministic seed.
+		if restart_idx > 0 && input.prefix.len() < seeded.len() {
+			let available = seeded.len() - input.prefix.len();
+			let changes = usize::min(available, (restart_idx as usize * 2).min(24));
+			for _ in 0..changes {
+				let idx = rng.gen_range(input.prefix.len()..seeded.len());
+				if cfg.allowed_mutable_bytes.is_none() {
+					let bit = rng.gen_range(0..8);
+					seeded[idx] ^= 1u8 << bit;
+				} else {
+					seeded[idx] = random_mutable_byte(cfg, &mut rng);
+				}
+			}
+		}
+		seeded
+	} else {
+		let mut random_init = vec![0u8; cap];
+		random_init[..input.prefix.len()].copy_from_slice(&input.prefix);
+		for b in &mut random_init[input.prefix.len()..] {
+			*b = random_mutable_byte(cfg, &mut rng);
+		}
+		random_init
+	};
+
 	current[..input.prefix.len()].copy_from_slice(&input.prefix);
-	for b in &mut current[input.prefix.len()..] {
-		*b = rng.r#gen();
-	}
 
 	let (mut current_enc, mut current_score) = evaluate_payload(&current, cfg, input, eval_ctx)?;
 	let mut best_payload = current.clone();
 	let mut best_enc = current_enc.clone();
 	let mut best_score = current_score;
+	let mut influence = vec![1.0f32; cap - input.prefix.len()];
+	let mut since_improvement = 0u64;
 
 	for iter in 0..cfg.max_iters {
+		if let Some(deadline) = stop_at {
+			if Instant::now() >= deadline {
+				break;
+			}
+		}
+
 		let mut proposal = current.clone();
-		mutate_payload(&mut proposal, input.prefix.len(), cfg, &mut rng);
+		let touched = mutate_payload(&mut proposal, input.prefix.len(), cfg, &influence, &mut rng);
 		let (proposal_enc, proposal_score) = evaluate_payload(&proposal, cfg, input, eval_ctx)?;
 
 		let delta = proposal_score.objective_score - current_score.objective_score;
@@ -191,26 +301,333 @@ fn run_single_restart(
 			current = proposal;
 			current_enc = proposal_enc;
 			current_score = proposal_score;
+			if delta > 0.0 {
+				for idx in touched {
+					let local = idx - input.prefix.len();
+					if let Some(weight) = influence.get_mut(local) {
+						*weight += 1.0 + delta * 250.0;
+					}
+				}
+			}
 		}
 
 		if current_score.objective_score > best_score.objective_score {
 			best_payload = current.clone();
 			best_enc = current_enc.clone();
 			best_score = current_score;
+			since_improvement = 0;
+		} else {
+			since_improvement += 1;
+		}
+
+		if (iter + 1) % 512 == 0 {
+			for w in &mut influence {
+				*w = (*w * 0.995).max(0.1);
+			}
+		}
+
+		if since_improvement > 600 && input.prefix.len() < current.len() {
+			since_improvement = 0;
+			current = best_payload.clone();
+			let available = current.len() - input.prefix.len();
+			let span = available.min(24);
+			let min_burst = 1usize.min(span);
+			let burst = rng.gen_range(min_burst..=span);
+			let start = rng.gen_range(input.prefix.len()..=(current.len() - burst));
+			for b in &mut current[start..start + burst] {
+				*b = random_mutable_byte(cfg, &mut rng);
+			}
+			let (enc, score) = evaluate_payload(&current, cfg, input, eval_ctx)?;
+			current_enc = enc;
+			current_score = score;
 		}
 	}
+
+	let (best_payload, best_enc, best_score) = coordinate_refine(
+		best_payload,
+		best_enc,
+		best_score,
+		input,
+		cfg,
+		eval_ctx,
+		&mut rng,
+		stop_at,
+	)?;
+	let (best_enc, best_score) = image_space_perturb(
+		best_enc,
+		best_score,
+		input,
+		cfg,
+		eval_ctx,
+		&mut rng,
+		stop_at,
+	)?;
 
 	Ok((best_payload, best_enc, best_score))
 }
 
+fn build_bitwise_seed_payload(
+	input: &OptimizeInput,
+	cfg: &OptimizeConfig,
+	eval_ctx: &EvalContext,
+) -> Result<Vec<u8>> {
+	let cap = capacity_bytes(cfg.spec)?;
+	if input.prefix.len() > cap {
+		return Err(QrodeError::PrefixTooLong {
+			prefix_len: input.prefix.len(),
+			capacity: cap,
+		});
+	}
+
+	let mut current = vec![0u8; cap];
+	current[..input.prefix.len()].copy_from_slice(&input.prefix);
+	let (_, mut current_score) = evaluate_payload(&current, cfg, input, eval_ctx)?;
+
+	if let Some(allowed) = cfg.allowed_mutable_bytes.as_ref() {
+		for byte_idx in input.prefix.len()..cap {
+			let mut best_byte = current[byte_idx];
+			let mut best_local_score = current_score;
+			for candidate in allowed {
+				if *candidate == current[byte_idx] {
+					continue;
+				}
+				let mut proposal = current.clone();
+				proposal[byte_idx] = *candidate;
+				let (_, proposal_score) = evaluate_payload(&proposal, cfg, input, eval_ctx)?;
+				if proposal_score.objective_score > best_local_score.objective_score {
+					best_byte = *candidate;
+					best_local_score = proposal_score;
+				}
+			}
+			if best_byte != current[byte_idx] {
+				current[byte_idx] = best_byte;
+				current_score = best_local_score;
+			}
+		}
+		return Ok(current);
+	}
+
+	for bit_idx in (input.prefix.len() * 8)..(cap * 8) {
+		let byte_idx = bit_idx / 8;
+		let bit = (bit_idx % 8) as u8;
+		let mut proposal = current.clone();
+		proposal[byte_idx] ^= 1u8 << bit;
+
+		let (_, proposal_score) = evaluate_payload(&proposal, cfg, input, eval_ctx)?;
+		if proposal_score.objective_score > current_score.objective_score {
+			current = proposal;
+			current_score = proposal_score;
+		}
+	}
+
+	Ok(current)
+}
+
+fn coordinate_refine(
+	mut payload: Vec<u8>,
+	mut enc: EncodedQr,
+	mut score: ScoreBreakdown,
+	input: &OptimizeInput,
+	cfg: &OptimizeConfig,
+	eval_ctx: &EvalContext,
+	rng: &mut Xoshiro256PlusPlus,
+	stop_at: Option<Instant>,
+) -> Result<(Vec<u8>, EncodedQr, ScoreBreakdown)> {
+	if cfg.coordinate_refine_sweeps == 0 || input.prefix.len() >= payload.len() {
+		return Ok((payload, enc, score));
+	}
+
+	if let Some(allowed) = cfg.allowed_mutable_bytes.as_ref() {
+		let mut indices: Vec<usize> = (input.prefix.len()..payload.len()).collect();
+		for _ in 0..cfg.coordinate_refine_sweeps {
+			indices.shuffle(rng);
+			let mut improved = false;
+
+			for byte_idx in &indices {
+				if let Some(deadline) = stop_at {
+					if Instant::now() >= deadline {
+						return Ok((payload, enc, score));
+					}
+				}
+
+				let mut best_byte = payload[*byte_idx];
+				let mut best_local_score = score;
+				let mut best_local_enc: Option<EncodedQr> = None;
+
+				for candidate in allowed {
+					if *candidate == payload[*byte_idx] {
+						continue;
+					}
+					let mut proposal = payload.clone();
+					proposal[*byte_idx] = *candidate;
+					let (proposal_enc, proposal_score) = evaluate_payload(&proposal, cfg, input, eval_ctx)?;
+					if proposal_score.objective_score > best_local_score.objective_score {
+						best_byte = *candidate;
+						best_local_score = proposal_score;
+						best_local_enc = Some(proposal_enc);
+					}
+				}
+
+				if best_byte != payload[*byte_idx] {
+					payload[*byte_idx] = best_byte;
+					score = best_local_score;
+					enc = best_local_enc.expect("best_local_enc present when improvement found");
+					improved = true;
+				}
+			}
+
+			if !improved {
+				break;
+			}
+		}
+
+		return Ok((payload, enc, score));
+	}
+
+	let mutable_start = input.prefix.len() * 8;
+	let mutable_end = payload.len() * 8;
+	let mut indices: Vec<usize> = (mutable_start..mutable_end).collect();
+
+	for _ in 0..cfg.coordinate_refine_sweeps {
+		indices.shuffle(rng);
+		let mut improved = false;
+
+		for bit_idx in &indices {
+			if let Some(deadline) = stop_at {
+				if Instant::now() >= deadline {
+					return Ok((payload, enc, score));
+				}
+			}
+
+			let byte_idx = bit_idx / 8;
+			let bit = (bit_idx % 8) as u8;
+			let mut proposal = payload.clone();
+			proposal[byte_idx] ^= 1u8 << bit;
+
+			let (proposal_enc, proposal_score) = evaluate_payload(&proposal, cfg, input, eval_ctx)?;
+			if proposal_score.objective_score > score.objective_score {
+				payload = proposal;
+				enc = proposal_enc;
+				score = proposal_score;
+				improved = true;
+			}
+		}
+
+		if !improved {
+			break;
+		}
+	}
+
+	Ok((payload, enc, score))
+}
+
+fn immutable_mask_for_selected_mask<'a>(
+	eval_ctx: &'a EvalContext,
+	selected: MaskPattern,
+) -> Option<&'a Vec<Vec<bool>>> {
+	eval_ctx
+		.masks
+		.iter()
+		.find_map(|(mask, imm)| if *mask == selected { Some(imm) } else { None })
+}
+
+fn image_space_perturb(
+	mut enc: EncodedQr,
+	mut score: ScoreBreakdown,
+	input: &OptimizeInput,
+	cfg: &OptimizeConfig,
+	eval_ctx: &EvalContext,
+	rng: &mut Xoshiro256PlusPlus,
+	stop_at: Option<Instant>,
+) -> Result<(EncodedQr, ScoreBreakdown)> {
+	if !cfg.enable_image_space_perturb || cfg.image_space_perturb_iters == 0 {
+		return Ok((enc, score));
+	}
+
+	let Some(imm) = immutable_mask_for_selected_mask(eval_ctx, enc.mask) else {
+		return Ok((enc, score));
+	};
+
+	let n = enc.modules.len();
+	if n == 0 {
+		return Ok((enc, score));
+	}
+
+	let mut coords = Vec::new();
+	for y in 0..n {
+		for x in 0..n {
+			if imm[y][x] {
+				coords.push((x, y));
+			}
+		}
+	}
+	if coords.is_empty() {
+		return Ok((enc, score));
+	}
+
+	let cap = capacity_bytes(cfg.spec)?;
+	for _ in 0..cfg.image_space_perturb_iters {
+		if let Some(deadline) = stop_at {
+			if Instant::now() >= deadline {
+				break;
+			}
+		}
+
+		let (x, y) = coords[rng.gen_range(0..coords.len())];
+		enc.modules[y][x] = !enc.modules[y][x];
+
+		let proposal = score_modules(&enc.modules, &input.target, imm, input.weights)?;
+		if proposal.objective_score > score.objective_score {
+			if let Some(decoded) = decode_modules_payload(&enc.modules) {
+				if decoded.len() == cap && decoded.starts_with(&input.prefix) {
+					score = proposal;
+					continue;
+				}
+			}
+		}
+
+		// Reject perturbation if no improvement or decode constraints are violated.
+		enc.modules[y][x] = !enc.modules[y][x];
+	}
+
+	Ok((enc, score))
+}
+
 pub fn optimize(input: OptimizeInput, config: OptimizeConfig) -> Result<OptimizeResult> {
 	let started = Instant::now();
+	if let Some(allowed) = config.allowed_mutable_bytes.as_ref() {
+		if allowed.is_empty() {
+			return Err(QrodeError::Internal(
+				"allowed_mutable_bytes cannot be empty".into(),
+			));
+		}
+	}
 	let eval_ctx = build_eval_context(&config)?;
+	let seed_payload = if config.bitwise_seed_init {
+		Some(build_bitwise_seed_payload(&input, &config, &eval_ctx)?)
+	} else {
+		None
+	};
+
+	let restarts = config.restarts.max(1);
+	let results: Vec<Result<(Vec<u8>, EncodedQr, ScoreBreakdown)>> = (0..restarts)
+		.into_par_iter()
+		.map(|restart| {
+			let seed = config.seed.wrapping_add(restart as u64 * 1_000_003);
+			run_single_restart(
+				&input,
+				&config,
+				&eval_ctx,
+				seed_payload.as_deref(),
+				restart,
+				seed,
+			)
+		})
+		.collect();
 
 	let mut global_best: Option<(Vec<u8>, EncodedQr, ScoreBreakdown)> = None;
-	for restart in 0..config.restarts.max(1) {
-		let seed = config.seed.wrapping_add(restart as u64 * 1_000_003);
-		let result = run_single_restart(&input, &config, &eval_ctx, seed)?;
+	for result in results {
+		let result = result?;
 		match &global_best {
 			Some((_, _, score)) if score.objective_score >= result.2.objective_score => {}
 			_ => global_best = Some(result),
@@ -224,8 +641,8 @@ pub fn optimize(input: OptimizeInput, config: OptimizeConfig) -> Result<Optimize
 		best_payload,
 		best_encoded,
 		best_score,
-		iterations: config.max_iters * config.restarts.max(1) as u64,
-		restarts_done: config.restarts.max(1),
+		iterations: config.max_iters * restarts as u64,
+		restarts_done: restarts,
 		elapsed_ms: started.elapsed().as_millis(),
 		seed: config.seed,
 	})
@@ -234,7 +651,7 @@ pub fn optimize(input: OptimizeInput, config: OptimizeConfig) -> Result<Optimize
 pub fn bench_hot_loop(iterations: u64, version: u8, seed: u64) -> Result<f32> {
 	let spec = QrSpec {
 		version,
-		ecc: crate::qr_core::EccLevel::M,
+		ecc: crate::qr_core::EccLevel::H,
 		mode: crate::qr_core::DataMode::Byte,
 	};
 	let target = crate::target_adapter::synthetic_circle_target(version)?;

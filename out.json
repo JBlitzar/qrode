@@ -1,0 +1,17 @@
+{
+  "version": 5,
+  "ecc": "M",
+  "mask": 0,
+  "seed": 1,
+  "capacity_bytes": 84,
+  "prefix_len": 0,
+  "suffix_len": 84,
+  "iterations": 24000,
+  "restarts": 2,
+  "elapsed_ms": 6208,
+  "mutable_match_pct": 60.606064,
+  "full_match_pct": 57.633312,
+  "objective_score": 0.62986255,
+  "decode_ok": null,
+  "decoded_payload_hex": null
+}

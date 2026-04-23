@@ -2,6 +2,8 @@ use rand::{Rng, SeedableRng};
 use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::qr_core::{
@@ -18,6 +20,8 @@ pub struct OptimizeConfig {
 	pub allowed_mutable_bytes: Option<Vec<u8>>,
 	pub enable_image_space_perturb: bool,
 	pub image_space_perturb_iters: u64,
+	pub progress_every_iters: Option<u64>,
+	pub progress_image_prefix: Option<PathBuf>,
 	pub bitwise_seed_init: bool,
 	pub coordinate_refine_sweeps: u32,
 	pub max_time_ms: Option<u128>,
@@ -45,6 +49,8 @@ impl Default for OptimizeConfig {
 			allowed_mutable_bytes: None,
 			enable_image_space_perturb: true,
 			image_space_perturb_iters: 2_000,
+			progress_every_iters: None,
+			progress_image_prefix: None,
 			bitwise_seed_init: true,
 			coordinate_refine_sweeps: 3,
 			max_time_ms: None,
@@ -114,6 +120,70 @@ fn random_mutable_byte(cfg: &OptimizeConfig, rng: &mut Xoshiro256PlusPlus) -> u8
 	} else {
 		rng.r#gen()
 	}
+}
+
+fn write_progress_png(modules: &[Vec<bool>], out_png: &PathBuf) -> Result<()> {
+	let module_px = 4u32;
+	let quiet_zone = 4u32;
+	let n = modules.len() as u32;
+	let img_size = (n + 2 * quiet_zone) * module_px;
+
+	let mut img = image::GrayImage::from_pixel(img_size, img_size, image::Luma([255u8]));
+	for (y, row) in modules.iter().enumerate() {
+		for (x, &dark) in row.iter().enumerate() {
+			let color = if dark { 0u8 } else { 255u8 };
+			let px0 = (x as u32 + quiet_zone) * module_px;
+			let py0 = (y as u32 + quiet_zone) * module_px;
+			for py in py0..py0 + module_px {
+				for px in px0..px0 + module_px {
+					img.put_pixel(px, py, image::Luma([color]));
+				}
+			}
+		}
+	}
+
+	img.save(out_png)
+		.map_err(|e| QrodeError::Internal(format!("failed to save progress png: {e}")))
+}
+
+fn maybe_emit_progress(
+	cfg: &OptimizeConfig,
+	restart_idx: u32,
+	iter: u64,
+	best_score: ScoreBreakdown,
+	best_enc: &EncodedQr,
+	restart_started: Instant,
+) -> Result<()> {
+	let Some(every) = cfg.progress_every_iters else {
+		return Ok(());
+	};
+	if every == 0 || (iter + 1) % every != 0 {
+		return Ok(());
+	}
+
+	println!(
+		"progress restart={} iter={} objective={:.6} ssim={:.6} mutable={:.3}% full={:.3}% elapsed={}ms",
+		restart_idx,
+		iter + 1,
+		best_score.objective_score,
+		best_score.ssim,
+		best_score.mutable_match_pct,
+		best_score.full_match_pct,
+		restart_started.elapsed().as_millis()
+	);
+	let _ = std::io::stdout().flush();
+
+	if let Some(prefix) = cfg.progress_image_prefix.as_ref() {
+		let path = PathBuf::from(format!(
+			"{}.r{}.i{:012}.png",
+			prefix.display(),
+			restart_idx,
+			iter + 1
+		));
+		write_progress_png(&best_enc.modules, &path)?;
+	}
+
+	Ok(())
 }
 
 fn build_eval_context(cfg: &OptimizeConfig) -> Result<EvalContext> {
@@ -341,6 +411,8 @@ fn run_single_restart(
 			current_enc = enc;
 			current_score = score;
 		}
+
+		maybe_emit_progress(cfg, restart_idx, iter, best_score, &best_enc, restart_started)?;
 	}
 
 	let (best_payload, best_enc, best_score) = coordinate_refine(

@@ -27,7 +27,7 @@ pub struct CliArgs {
 	pub out_png: PathBuf,
 	#[arg(long, default_value = "out.json")]
 	pub out_json: PathBuf,
-	#[arg(long, default_value_t = 5)]
+	#[arg(long, default_value_t = 20)]
 	pub version: u8,
 	#[arg(long, default_value = "H")]
 	pub ecc: String,

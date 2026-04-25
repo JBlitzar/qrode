@@ -18,6 +18,7 @@ pub struct OptimizeConfig {
 	pub spec: QrSpec,
 	pub fixed_mask: Option<MaskPattern>,
 	pub search_masks: bool,
+	pub initial_payload: Option<Vec<u8>>,
 	pub allowed_mutable_bytes: Option<Vec<u8>>,
 	pub enable_image_space_perturb: bool,
 	pub image_space_perturb_iters: u64,
@@ -25,6 +26,7 @@ pub struct OptimizeConfig {
 	pub progress_every_secs: Option<u64>,
 	pub progress_image_path: Option<PathBuf>,
 	pub bitwise_seed_init: bool,
+	pub single_thread: bool,
 	pub coordinate_refine_sweeps: u32,
 	pub max_time_ms: Option<u128>,
 	pub seed: u64,
@@ -48,6 +50,7 @@ impl Default for OptimizeConfig {
 			},
 			fixed_mask: Some(MaskPattern::M0),
 			search_masks: false,
+			initial_payload: None,
 			allowed_mutable_bytes: None,
 			enable_image_space_perturb: true,
 			image_space_perturb_iters: 2_000,
@@ -55,6 +58,7 @@ impl Default for OptimizeConfig {
 			progress_every_secs: Some(10),
 			progress_image_path: None,
 			bitwise_seed_init: true,
+			single_thread: false,
 			coordinate_refine_sweeps: 3,
 			max_time_ms: None,
 			seed: 1,
@@ -656,7 +660,7 @@ fn image_space_perturb(
 	let mut coords = Vec::new();
 	for y in 0..n {
 		for x in 0..n {
-			if imm[y][x] {
+			if !imm[y][x] {
 				coords.push((x, y));
 			}
 		}
@@ -703,7 +707,22 @@ pub fn optimize(input: OptimizeInput, config: OptimizeConfig) -> Result<Optimize
 		}
 	}
 	let eval_ctx = build_eval_context(&config)?;
-	let seed_payload = if config.bitwise_seed_init {
+	let cap = capacity_bytes(config.spec)?;
+	let seed_payload = if let Some(initial) = config.initial_payload.as_ref() {
+		if initial.len() != cap {
+			return Err(QrodeError::Internal(format!(
+				"initial_payload length mismatch: got {}, expected {}",
+				initial.len(),
+				cap,
+			)));
+		}
+		if !initial.starts_with(&input.prefix) {
+			return Err(QrodeError::Internal(
+				"initial_payload does not preserve required prefix".into(),
+			));
+		}
+		Some(initial.clone())
+	} else if config.bitwise_seed_init {
 		Some(build_bitwise_seed_payload(&input, &config, &eval_ctx)?)
 	} else {
 		None
@@ -716,22 +735,40 @@ pub fn optimize(input: OptimizeInput, config: OptimizeConfig) -> Result<Optimize
 	});
 
 	let restarts = config.restarts.max(1);
-	let results: Vec<Result<(Vec<u8>, EncodedQr, ScoreBreakdown)>> = (0..restarts)
-		.into_par_iter()
-		.map(|restart| {
-			let progress_state = progress_state.clone();
-			let seed = config.seed.wrapping_add(restart as u64 * 1_000_003);
-			run_single_restart(
-				&input,
-				&config,
-				&eval_ctx,
-				seed_payload.as_deref(),
-				progress_state.as_ref(),
-				restart,
-				seed,
-			)
-		})
-		.collect();
+	let results: Vec<Result<(Vec<u8>, EncodedQr, ScoreBreakdown)>> = if config.single_thread {
+		(0..restarts)
+			.map(|restart| {
+				let progress_state = progress_state.clone();
+				let seed = config.seed.wrapping_add(restart as u64 * 1_000_003);
+				run_single_restart(
+					&input,
+					&config,
+					&eval_ctx,
+					seed_payload.as_deref(),
+					progress_state.as_ref(),
+					restart,
+					seed,
+				)
+			})
+			.collect()
+	} else {
+		(0..restarts)
+			.into_par_iter()
+			.map(|restart| {
+				let progress_state = progress_state.clone();
+				let seed = config.seed.wrapping_add(restart as u64 * 1_000_003);
+				run_single_restart(
+					&input,
+					&config,
+					&eval_ctx,
+					seed_payload.as_deref(),
+					progress_state.as_ref(),
+					restart,
+					seed,
+				)
+			})
+			.collect()
+	};
 
 	let mut global_best: Option<(Vec<u8>, EncodedQr, ScoreBreakdown)> = None;
 	for result in results {

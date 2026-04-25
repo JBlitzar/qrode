@@ -21,3 +21,4 @@ target/
 /target
 
 res/frames/*.jpg
+outba*/*

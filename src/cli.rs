@@ -41,6 +41,10 @@ pub struct CliArgs {
 	pub seed: Option<u64>,
 	#[arg(long)]
 	pub max_iters: Option<u64>,
+	#[arg(long, default_value_t = 0)]
+	pub progress_every_iters: u64,
+	#[arg(long, default_value_t = 10)]
+	pub progress_every_secs: u64,
 	#[arg(long)]
 	pub time_budget_secs: Option<u64>,
 	#[arg(long)]
@@ -233,6 +237,17 @@ pub fn run(args: CliArgs) -> Result<()> {
 		search_masks: args.search_masks,
 		allowed_mutable_bytes,
 		enable_image_space_perturb: args.enable_image_space_perturb,
+		progress_every_iters: if args.progress_every_iters == 0 {
+			None
+		} else {
+			Some(args.progress_every_iters)
+		},
+		progress_every_secs: if args.progress_every_secs == 0 {
+			None
+		} else {
+			Some(args.progress_every_secs)
+		},
+		progress_image_path: Some(args.out_png.clone()),
 		seed,
 		max_iters: args.max_iters.unwrap_or(default_iters),
 		max_time_ms: Some(time_budget_ms),

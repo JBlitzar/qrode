@@ -4,6 +4,7 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::qr_core::{
@@ -21,7 +22,8 @@ pub struct OptimizeConfig {
 	pub enable_image_space_perturb: bool,
 	pub image_space_perturb_iters: u64,
 	pub progress_every_iters: Option<u64>,
-	pub progress_image_prefix: Option<PathBuf>,
+	pub progress_every_secs: Option<u64>,
+	pub progress_image_path: Option<PathBuf>,
 	pub bitwise_seed_init: bool,
 	pub coordinate_refine_sweeps: u32,
 	pub max_time_ms: Option<u128>,
@@ -50,7 +52,8 @@ impl Default for OptimizeConfig {
 			enable_image_space_perturb: true,
 			image_space_perturb_iters: 2_000,
 			progress_every_iters: None,
-			progress_image_prefix: None,
+			progress_every_secs: Some(10),
+			progress_image_path: None,
 			bitwise_seed_init: true,
 			coordinate_refine_sweeps: 3,
 			max_time_ms: None,
@@ -87,6 +90,11 @@ pub struct OptimizeResult {
 
 struct EvalContext {
 	masks: Vec<(MaskPattern, Vec<Vec<bool>>)>,
+}
+
+struct ProgressState {
+	best_objective: f32,
+	output_path: PathBuf,
 }
 
 fn weighted_index(weights: &[f32], rng: &mut Xoshiro256PlusPlus) -> usize {
@@ -153,11 +161,19 @@ fn maybe_emit_progress(
 	best_score: ScoreBreakdown,
 	best_enc: &EncodedQr,
 	restart_started: Instant,
+	last_progress_emit: &mut Instant,
+	progress_state: Option<&Arc<Mutex<ProgressState>>>,
 ) -> Result<()> {
-	let Some(every) = cfg.progress_every_iters else {
-		return Ok(());
-	};
-	if every == 0 || (iter + 1) % every != 0 {
+	let iter_trigger = cfg
+		.progress_every_iters
+		.map(|every| every > 0 && (iter + 1) % every == 0)
+		.unwrap_or(false);
+	let time_trigger = cfg
+		.progress_every_secs
+		.map(|secs| secs > 0 && last_progress_emit.elapsed().as_secs() >= secs)
+		.unwrap_or(false);
+
+	if !iter_trigger && !time_trigger {
 		return Ok(());
 	}
 
@@ -172,15 +188,16 @@ fn maybe_emit_progress(
 		restart_started.elapsed().as_millis()
 	);
 	let _ = std::io::stdout().flush();
+	*last_progress_emit = Instant::now();
 
-	if let Some(prefix) = cfg.progress_image_prefix.as_ref() {
-		let path = PathBuf::from(format!(
-			"{}.r{}.i{:012}.png",
-			prefix.display(),
-			restart_idx,
-			iter + 1
-		));
-		write_progress_png(&best_enc.modules, &path)?;
+	if let Some(state) = progress_state {
+		let mut guard = state
+			.lock()
+			.map_err(|_| QrodeError::Internal("progress state lock poisoned".into()))?;
+		if best_score.objective_score > guard.best_objective {
+			guard.best_objective = best_score.objective_score;
+			write_progress_png(&best_enc.modules, &guard.output_path)?;
+		}
 	}
 
 	Ok(())
@@ -295,6 +312,7 @@ fn run_single_restart(
 	cfg: &OptimizeConfig,
 	eval_ctx: &EvalContext,
 	seed_payload: Option<&[u8]>,
+	progress_state: Option<&Arc<Mutex<ProgressState>>>,
 	restart_idx: u32,
 	seed: u64,
 ) -> Result<(Vec<u8>, EncodedQr, ScoreBreakdown)> {
@@ -346,6 +364,7 @@ fn run_single_restart(
 	let mut best_score = current_score;
 	let mut influence = vec![1.0f32; cap - input.prefix.len()];
 	let mut since_improvement = 0u64;
+	let mut last_progress_emit = restart_started;
 
 	for iter in 0..cfg.max_iters {
 		if let Some(deadline) = stop_at {
@@ -412,7 +431,16 @@ fn run_single_restart(
 			current_score = score;
 		}
 
-		maybe_emit_progress(cfg, restart_idx, iter, best_score, &best_enc, restart_started)?;
+		maybe_emit_progress(
+			cfg,
+			restart_idx,
+			iter,
+			best_score,
+			&best_enc,
+			restart_started,
+			&mut last_progress_emit,
+			progress_state,
+		)?;
 	}
 
 	let (best_payload, best_enc, best_score) = coordinate_refine(
@@ -680,17 +708,25 @@ pub fn optimize(input: OptimizeInput, config: OptimizeConfig) -> Result<Optimize
 	} else {
 		None
 	};
+	let progress_state = config.progress_image_path.as_ref().map(|path| {
+		Arc::new(Mutex::new(ProgressState {
+			best_objective: f32::NEG_INFINITY,
+			output_path: path.clone(),
+		}))
+	});
 
 	let restarts = config.restarts.max(1);
 	let results: Vec<Result<(Vec<u8>, EncodedQr, ScoreBreakdown)>> = (0..restarts)
 		.into_par_iter()
 		.map(|restart| {
+			let progress_state = progress_state.clone();
 			let seed = config.seed.wrapping_add(restart as u64 * 1_000_003);
 			run_single_restart(
 				&input,
 				&config,
 				&eval_ctx,
 				seed_payload.as_deref(),
+				progress_state.as_ref(),
 				restart,
 				seed,
 			)

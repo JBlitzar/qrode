@@ -76,7 +76,9 @@ pub struct CliArgs {
 	pub frame_seed_diff_pct: f32,
 	#[arg(long, default_value_t = 500_000)]
 	pub seeded_frame_iters: u64,
-	#[arg(long, default_value_t = 0.165)]
+	#[arg(long, default_value_t = 2_000)]
+	pub min_seeded_iters: u64,
+	#[arg(long, default_value_t = 0.10)]
 	pub objective_target: f32,
 	#[arg(long, default_value_t = false)]
 	pub write_json: bool,
@@ -446,11 +448,14 @@ pub fn run(args: CliArgs) -> Result<()> {
 		| -> Result<Vec<u8>> {
 			let seeded_mode = initial_payload.is_some();
 			let frame_seed = seed.wrapping_add(job.index as u64 * 1_000_003);
-			let frame_max_iters = if seeded_mode {
+			let mut frame_max_iters = if seeded_mode {
 				args.seeded_frame_iters
 			} else {
 				args.max_iters.unwrap_or(default_iters)
 			};
+			if seeded_mode {
+				frame_max_iters = frame_max_iters.max(args.min_seeded_iters.max(1));
+			}
 			let frame_restarts = if seeded_mode {
 				1
 			} else {
@@ -488,7 +493,6 @@ pub fn run(args: CliArgs) -> Result<()> {
 				},
 			};
 
-			let mut forced_seed_result = None;
 			let mut initial_payload_for_opt = initial_payload;
 			if let Some(seed_payload) = initial_payload_for_opt.clone() {
 				let seed_diff = seed_diff_ratio.unwrap_or(1.0);
@@ -543,47 +547,38 @@ pub fn run(args: CliArgs) -> Result<()> {
 						};
 						let jitter_eval = optimize(input.clone(), jitter_cfg)?;
 						if jitter_eval.best_score.objective_score >= args.objective_target {
-							forced_seed_result = Some(jitter_eval);
 							initial_payload_for_opt = Some(jittered);
 						}
-					}
-
-					if forced_seed_result.is_none() {
-						forced_seed_result = Some(seed_eval);
 					}
 				}
 			}
 
-			let result = if let Some(prechecked) = forced_seed_result {
-				prechecked
-			} else {
-				let cfg = OptimizeConfig {
-					spec,
-					fixed_mask,
-					search_masks: args.search_masks,
-					initial_payload: initial_payload_for_opt,
-					allowed_mutable_bytes: allowed_mutable_bytes.clone(),
-					enable_image_space_perturb: args.enable_image_space_perturb,
-					progress_every_iters: if args.progress_every_iters == 0 {
-						None
-					} else {
-						Some(args.progress_every_iters)
-					},
-					progress_every_secs: if args.progress_every_secs == 0 {
-						None
-					} else {
-						Some(args.progress_every_secs)
-					},
-					progress_image_path: Some(frame_png.clone()),
-					seed: frame_seed,
-					max_iters: frame_max_iters,
-					max_time_ms: Some(time_budget_ms),
-					restarts: frame_restarts,
-					single_thread: seeded_mode,
-					..OptimizeConfig::default()
-				};
-				optimize(input, cfg)?
+			let cfg = OptimizeConfig {
+				spec,
+				fixed_mask,
+				search_masks: args.search_masks,
+				initial_payload: initial_payload_for_opt,
+				allowed_mutable_bytes: allowed_mutable_bytes.clone(),
+				enable_image_space_perturb: args.enable_image_space_perturb,
+				progress_every_iters: if args.progress_every_iters == 0 {
+					None
+				} else {
+					Some(args.progress_every_iters)
+				},
+				progress_every_secs: if args.progress_every_secs == 0 {
+					None
+				} else {
+					Some(args.progress_every_secs)
+				},
+				progress_image_path: Some(frame_png.clone()),
+				seed: frame_seed,
+				max_iters: frame_max_iters,
+				max_time_ms: Some(time_budget_ms),
+				restarts: frame_restarts,
+				single_thread: seeded_mode,
+				..OptimizeConfig::default()
 			};
+			let result = optimize(input, cfg)?;
 			let canonical = encode_with_mask(spec, &result.best_payload, result.best_encoded.mask)?;
 			write_qr_png(&canonical.modules, &frame_png)?;
 

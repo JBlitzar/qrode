@@ -40,7 +40,7 @@ pub struct CliArgs {
     pub out_png: PathBuf,
     #[arg(long, default_value = "out.json")]
     pub out_json: PathBuf,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 10)]
     pub version: u8,
     #[arg(long, default_value = "H")]
     pub ecc: String,
@@ -64,7 +64,7 @@ pub struct CliArgs {
     pub restarts: Option<u32>,
     #[arg(long)]
     pub mask: Option<u8>,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     pub search_masks: bool,
     #[arg(long = "no-image-space-perturb", action = clap::ArgAction::SetFalse, default_value_t = true)]
     pub enable_image_space_perturb: bool,
@@ -401,7 +401,7 @@ pub fn run(args: CliArgs) -> Result<()> {
     let (default_iters, default_restarts, default_time_budget_secs) = match args.mode.as_str() {
         "quick" => (
             5_000_000,
-            (rayon::current_num_threads() as u32).clamp(2, 8),
+            ((rayon::current_num_threads() - 1) as u32).clamp(2, 8),
             15u64,
         ),
         "quality" => (

@@ -11,7 +11,7 @@ Strategy 0: Everyone's seen the option on most online qr code generators to just
 
 One strategy is to just heavily abuse ecc and directly blit the image but keep the center pixel in a 3x3 module, like in [this repo](https://github.com/x-hw/amazing-qr). This is actually utilizing a deep fact about qr code scanner implementations, which is that the extracted bitmap is more biased to the center of each pixel. So this messes around with the surrounding subpixels, and hopes that ECC fixes up any bodged cells.
 
-Another is by using diffusion models to generate an image following a prompt while simultaneously conditioning it to follow a provided qr code image, like in [this huggingface page](https://huggingface.co/monster-labs/control_v1p_sd15_qrcode_monster). Still, this involves post-processing in image-space 
+Another is by using diffusion models to generate an image following a prompt while simultaneously conditioning it to follow a provided qr code image, like in [this huggingface page](https://huggingface.co/monster-labs/control_v1p_sd15_qrcode_monster). Still, this involves post-processing in image space.
 
 Lastly, there's the strategy to mostly just abuse payload size, directly construct the data regions, and then let ECC do whatever (like [here](https://www.reddit.com/r/ProgrammerHumor/comments/kt1zz8/i_created_the_worlds_first_scannable_qr_gif/
 )). This one's admirable because it at least constructs URLs rather than doing any image-space fiddling. It also produces pixel-perfect image results. It's still a little jarring to see the error correction region filled with random noise. To put it differently, the images are almost *too* good, and it makes the finder patterns seem out of place.
@@ -37,6 +37,8 @@ All of that for a ~70% pixel match to the target if I'm lucky. For reference, ra
 Larger QR codes weren't much better.
 
 ![](docs/qr_circle.png)
+
+> *Did you see the circle?*
 
 So the video format helps a lot! The pixel-level noise is blurred away perceptually each frame, and the blurry shapes are what's left behind, similar to the premise of [this shader](youtube.com/watch?v=RNhiT-SmR1Q). 
 

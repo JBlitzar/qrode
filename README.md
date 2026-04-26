@@ -40,7 +40,7 @@ Larger QR codes weren't much better.
 
 > *Did you see the circle?*
 
-So the video format helps a lot! The pixel-level noise is blurred away perceptually each frame, and the blurry shapes are what's left behind, similar to the premise of [this shader](youtube.com/watch?v=RNhiT-SmR1Q). 
+So the video format helps a lot! The pixel-level noise is blurred away perceptually each frame, and the blurry shapes are what's left behind, similar to the premise of [this shader](https://youtube.com/watch?v=RNhiT-SmR1Q). 
 
 It's possible to respin lack of good convergence as... subtlety, I suppose. At least the whole thing is textured homogenously. Just think! None of the other direct construction methods would work on QR codes this small, because ECC would dominate. Qrode doesn't care about the distinction between ECC and data regions. It's all a black-box optimization problem. Which is simultaneously a smart and a dumb approach. 
 

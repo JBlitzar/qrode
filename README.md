@@ -31,9 +31,31 @@ It's multithreaded and can try multiple paths at the same time, but empirically 
 
 For video that is temporally continuous, you seed subsequent frames with the nearest previous match.
 
-There are a bunch of CLI options, run with `--help` or code-dig [src/cli.rs](src/cli.rs) to figure out what they do.
+All of that for a ~70% pixel match to the target if I'm lucky. For reference, random noise is 50%. I polled a few people by showing them static images with patterns baked in, and most didn't notice anything off until I pointed it out. It's also pretty blurry, you can't see any detail.
+
+Larger QR codes weren't much better.
+
+![](docs/qr_circle.png)
+
+So the video format helps a lot! The pixel-level noise is blurred away perceptually each frame, and the blurry shapes are what's left behind, similar to the premise of [this shader](youtube.com/watch?v=RNhiT-SmR1Q). 
+
+It's possible to respin lack of good convergence as... subtlety, I suppose. At least the whole thing is textured homogenously.
+
+In summary:
+Upsides: It looks like a normal QR code
+Downsides: It looks like a normal QR code.
+
+
 
 ## Run it yourself
+
+Maybe one day I'll publish to crates or build some binaries. 
+```bash
+cargo run --release -- --help
+```
+
+There are a bunch of CLI options, run with `--help` or code-dig [src/cli.rs](src/cli.rs) to figure out what they do.
+
 
 ```bash
 cargo run --release -- --target-kind frames --frames-dir res/frames --mode quality --version 10 --ecc L --payload-mode url --out-png outba/out_badapple.png

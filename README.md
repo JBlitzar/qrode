@@ -42,8 +42,10 @@ So the video format helps a lot! The pixel-level noise is blurred away perceptua
 It's possible to respin lack of good convergence as... subtlety, I suppose. At least the whole thing is textured homogenously.
 
 In summary:
-Upsides: It looks like a normal QR code
-Downsides: It looks like a normal QR code.
+Upsides: 
+  - It looks like a normal QR code
+Downsides: 
+  - It looks like a normal QR code.
 
 
 

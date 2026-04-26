@@ -7,13 +7,14 @@ Every frame is scannable! Try it yourself.
 
 ## A brief history of qr code image steg
 
+Strategy 0: Everyone's seen the option on most online qr code generators to just stick a logo in the middle. ECC takes care of the rest, you obliterate some pixels. Let's move on to some actual techniques.
 
-One strategy is to just heavily abuse ecc and directly blit the image but keep the center pixel in a 3x3 module, like in [this repo](https://github.com/x-hw/amazing-qr)
+One strategy is to just heavily abuse ecc and directly blit the image but keep the center pixel in a 3x3 module, like in [this repo](https://github.com/x-hw/amazing-qr). This is actually utilizing a deep fact about qr code scanner implementations, which is that the extracted bitmap is more biased to the center of each pixel. So this messes around with the surrounding subpixels, and hopes that ECC fixes up any bodged cells.
 
 Another is by using diffusion models to generate an image following a prompt while simultaneously conditioning it to follow a provided qr code image, like in [this huggingface page](https://huggingface.co/monster-labs/control_v1p_sd15_qrcode_monster). Still, this involves post-processing in image-space 
 
 Lastly, there's the strategy to mostly just abuse payload size, directly construct the data regions, and then let ECC do whatever (like [here](https://www.reddit.com/r/ProgrammerHumor/comments/kt1zz8/i_created_the_worlds_first_scannable_qr_gif/
-)). This one's admirable because it at least constructs URLs rather than doing any image-space fiddling. It also produces pixel-perfect image results. It's still a little jarring to see the error correction region filled with random noise.
+)). This one's admirable because it at least constructs URLs rather than doing any image-space fiddling. It also produces pixel-perfect image results. It's still a little jarring to see the error correction region filled with random noise. To put it differently, the images are almost *too* good, and it makes the finder patterns seem out of place.
 
 In my opinion, all of these techniques are a little bit *too* good. The qr codes they generate don't look like qr codes (which I guess is the point, they're supposed to look like the target image). 
 
@@ -23,7 +24,7 @@ Qrode is different: It directly generates payloads (with an optional fixed prefi
 
 TODO expand upon this
 
-Hill climbing with annealing and a bit of image-space perturbation. I try direct construction and try a bunch of stuff out beyond that. I cache/precompute as much as possible.
+Hill climbing with annealing and a bit of image-space perturbation. I try direct construction as a seed and try a bunch of perturbations out beyond that. I cache/precompute as much as possible.
 
 I use ssim as a metric over mse matching, which has the nice property of being brightness-invariant (for the most part) but preserving shapes relative to each other. Plus, I get to say that I optimize a perceptual metric.
 

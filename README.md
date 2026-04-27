@@ -9,7 +9,7 @@ Every frame is scannable! Try it yourself.
 
 Strategy 0: Everyone's seen the option on most online qr code generators to just stick a logo in the middle. ECC takes care of the rest, you obliterate some pixels. Let's move on to some actual techniques.
 
-One strategy is to just heavily abuse ecc and directly blit the image but keep the center pixel in a 3x3 module, like in [this repo](https://github.com/x-hw/amazing-qr). This is actually utilizing a deep fact about qr code scanner implementations, which is that the extracted bitmap is more biased to the center of each pixel. So this messes around with the surrounding subpixels, and hopes that ECC fixes up any bodged cells.
+One strategy is to just heavily abuse ecc and directly blit the image but keep the center pixel in a 3x3 module, like in [this repo](https://github.com/x-hw/amazing-qr). This is actually utilizing a deep fact about qr code scanner implementations, which is that the extracted bitmap is more biased to the center of each pixel. So this messes around with the surrounding subpixels, and hopes that ECC fixes up any bodged cells. Here's a [paper](https://www.researchgate.net/publication/262527881_QR_Images_Optimized_Image_Embedding_in_QR_Codes) on that technique, explaining it more rigorously. 
 
 Another is by using diffusion models to generate an image following a prompt while simultaneously conditioning it to follow a provided qr code image, like in [this huggingface page](https://huggingface.co/monster-labs/control_v1p_sd15_qrcode_monster). Still, this involves post-processing in image space.
 
